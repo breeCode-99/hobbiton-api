@@ -3,5 +3,5 @@ uvicorn
 pillow
 python-multipart
 gdown
-opencv-python-headless==4.5.5.64
-ultralytics==8.0.196
+ultralytics
+opencv-python-headless
