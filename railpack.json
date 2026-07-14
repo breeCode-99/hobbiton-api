@@ -1,0 +1,7 @@
+{
+  "packages": {
+    "libxcb": "latest",
+    "libx11": "latest",
+    "libglib2.0": "latest"
+  }
+}
