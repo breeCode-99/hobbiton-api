@@ -222,7 +222,7 @@ async def inspect_damage(file: UploadFile = File(...)):
     })
 
 @app.post("/inspect/annotated")
-async def inspect_damage_annotated(file: UploadFile = File(...)):
+async def inspect_damage_annotated(file: UploadFile = File(...), skip_fraud: bool = False):
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
     image_bytes = await file.read()
@@ -238,7 +238,7 @@ async def inspect_damage_annotated(file: UploadFile = File(...)):
     results       = model.predict(image, conf=0.25, verbose=False)
     inference_ms  = round((time.time() - start_time) * 1000, 1)
     detections    = parse_detections(results, image)
-    fraud_flags   = run_fraud_checks(image, image_bytes, detections)
+    fraud_flags   = [] if skip_fraud else run_fraud_checks(image, image_bytes, detections)
     fraud_risk    = get_fraud_risk(fraud_flags)
     annotated_b64 = draw_damage_boxes(image, detections)
     return JSONResponse(content={
