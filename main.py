@@ -15,6 +15,13 @@ import uvicorn
 from ultralytics import YOLO
 from PIL import Image, ImageDraw
 
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.colors import HexColor, white, black
+from reportlab.lib.utils import ImageReader
+from fastapi.responses import StreamingResponse
+import io as _io
+
 # ── Download model from Google Drive if not present ───────────────
 MODEL_PATH     = "best.pt"
 GDRIVE_FILE_ID = "10K8spP0obRmGOCGudCWYnu4soe1ni6e9"
@@ -358,3 +365,292 @@ async def inspect_video(file: UploadFile = File(...)):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+
+# ── PDF Report Generation ─────────────────────────────────────────
+
+def generate_pdf_report(data: dict) -> bytes:
+    """Generate a professional PDF report from inspection data."""
+    buf = _io.BytesIO()
+    W, H = A4  # 595 x 842
+
+    c = canvas.Canvas(buf, pagesize=A4)
+
+    # ── Colours ──────────────────────────────────────────
+    GREEN      = HexColor("#1A6B32")
+    GREEN_LIGHT= HexColor("#F0F7F2")
+    RED        = HexColor("#B91C1C")
+    RED_LIGHT  = HexColor("#FEF2F2")
+    AMBER      = HexColor("#B45309")
+    AMBER_LIGHT= HexColor("#FFFBEB")
+    GREY_LIGHT = HexColor("#F9FAFB")
+    GREY_MID   = HexColor("#E5E7EB")
+    GREY_DARK  = HexColor("#6B7280")
+    TEXT_DARK  = HexColor("#111827")
+    TEXT_MID   = HexColor("#374151")
+
+    # ── Helper functions ──────────────────────────────────
+    def draw_rect(x, y, w, h, fill, stroke=None, radius=4):
+        c.setFillColor(fill)
+        if stroke:
+            c.setStrokeColor(stroke)
+            c.setLineWidth(1)
+            c.roundRect(x, y, w, h, radius, fill=1, stroke=1)
+        else:
+            c.setStrokeColor(fill)
+            c.roundRect(x, y, w, h, radius, fill=1, stroke=0)
+
+    def text(txt, x, y, font="Helvetica", size=10, color=TEXT_DARK, align="left"):
+        c.setFont(font, size)
+        c.setFillColor(color)
+        if align == "center":
+            tw = c.stringWidth(txt, font, size)
+            c.drawString(x - tw/2, y, txt)
+        elif align == "right":
+            tw = c.stringWidth(txt, font, size)
+            c.drawString(x - tw, y, txt)
+        else:
+            c.drawString(x, y, txt)
+
+    # ── HEADER ────────────────────────────────────────────
+    draw_rect(0, H-80, W, 80, GREEN)
+
+    # Logo box
+    draw_rect(32, H-64, 40, 40, white, radius=6)
+    text("HI", 52, H-38, "Helvetica-Bold", 14, GREEN, "center")
+
+    # Title
+    text("HOBBITON INVESTMENTS", 84, H-36, "Helvetica-Bold", 14, white)
+    text("Vehicle Damage Inspection Report", 84, H-52, "Helvetica", 10, HexColor("#C3DEC9"))
+
+    # Claim ID top right
+    claim_id = data.get("claim_id", "—")
+    text(claim_id, W-32, H-36, "Helvetica-Bold", 10, white, "right")
+    ts = data.get("timestamp", "")[:19].replace("T", " ")
+    text(ts, W-32, H-52, "Helvetica", 9, HexColor("#C3DEC9"), "right")
+
+    y = H - 100
+
+    # ── ANNOTATED IMAGE ───────────────────────────────────
+    ann = data.get("annotated_image", {})
+    if ann and ann.get("data"):
+        try:
+            import base64
+            img_bytes = base64.b64decode(ann["data"])
+            img_buf   = _io.BytesIO(img_bytes)
+            img_reader = ImageReader(img_buf)
+            img_w, img_h = 531, 220
+            draw_rect(32, y - img_h - 4, img_w + 4, img_h + 4, GREY_MID, radius=6)
+            c.drawImage(img_reader, 34, y - img_h - 2, width=img_w, height=img_h,
+                       preserveAspectRatio=True, mask="auto")
+            y -= (img_h + 20)
+        except Exception:
+            y -= 10
+    else:
+        y -= 10
+
+    # ── DAMAGE ASSESSMENT SECTION ─────────────────────────
+    draw_rect(32, y-28, W-64, 28, GREEN, radius=6)
+    text("DAMAGE ASSESSMENT", 44, y-18, "Helvetica-Bold", 11, white)
+
+    # Overall severity badge
+    dam   = data.get("damage_assessment", {})
+    sev   = dam.get("overall_severity", "None")
+    sev_color = RED if sev=="Severe" else AMBER if sev=="Moderate" else GREEN if sev=="Minor" else GREY_DARK
+    sev_bg    = RED_LIGHT if sev=="Severe" else AMBER_LIGHT if sev=="Moderate" else GREEN_LIGHT if sev=="Minor" else GREY_LIGHT
+    sev_w = c.stringWidth(f"  {sev}  ", "Helvetica-Bold", 10) + 8
+    draw_rect(W-32-sev_w, y-24, sev_w, 20, sev_bg, sev_color, radius=4)
+    text(sev.upper(), W-32-sev_w/2, y-16, "Helvetica-Bold", 9, sev_color, "center")
+
+    y -= 40
+
+    # Summary row
+    total = dam.get("total_detections", 0)
+    inf   = dam.get("inference_time_ms", 0)
+    img_info = data.get("image_info", {})
+
+    for i, (label, val) in enumerate([
+        ("Total Detections", str(total)),
+        ("Inference Time", f"{inf}ms"),
+        ("Image Size", img_info.get("dimensions","—")),
+        ("File", img_info.get("filename","—")[:20]),
+    ]):
+        bx = 32 + i * 132
+        draw_rect(bx, y-36, 126, 36, GREY_LIGHT, GREY_MID, radius=4)
+        text(label, bx+8, y-14, "Helvetica", 7, GREY_DARK)
+        text(val, bx+8, y-28, "Helvetica-Bold", 9, TEXT_DARK)
+
+    y -= 52
+
+    # Detections table
+    detections = dam.get("detections", [])
+    if detections:
+        # Table header
+        headers = ["#", "Damage Type", "Location", "Severity", "Confidence"]
+        widths  = [24, 150, 160, 90, 90]
+        cols    = [32, 56, 206, 366, 456]
+
+        draw_rect(32, y-22, W-64, 22, HexColor("#F3F4F6"), radius=0)
+        c.setStrokeColor(GREY_MID)
+        c.setLineWidth(0.5)
+        c.rect(32, y-22, W-64, 22, fill=0, stroke=1)
+
+        for i, h in enumerate(headers):
+            text(h, cols[i]+4, y-14, "Helvetica-Bold", 8, GREY_DARK)
+        y -= 22
+
+        # Table rows
+        for idx, det in enumerate(detections):
+            row_bg = white if idx % 2 == 0 else GREY_LIGHT
+            draw_rect(32, y-22, W-64, 22, row_bg, radius=0)
+            c.setStrokeColor(GREY_MID)
+            c.setLineWidth(0.3)
+            c.rect(32, y-22, W-64, 22, fill=0, stroke=1)
+
+            det_sev   = det.get("severity","")
+            det_color = RED if det_sev=="Severe" else AMBER if det_sev=="Moderate" else GREEN
+
+            text(str(idx+1),            cols[0]+4, y-14, "Helvetica", 8, GREY_DARK)
+            text(det.get("class",""),   cols[1]+4, y-14, "Helvetica-Bold", 8, TEXT_DARK)
+            text(det.get("location",""),cols[2]+4, y-14, "Helvetica", 8, TEXT_MID)
+            text(det_sev,               cols[3]+4, y-14, "Helvetica-Bold", 8, det_color)
+            text(f"{int(det.get('confidence',0)*100)}%", cols[4]+4, y-14, "Helvetica", 8, TEXT_MID)
+
+            y -= 22
+            if y < 180:
+                c.showPage()
+                y = H - 60
+    else:
+        draw_rect(32, y-36, W-64, 36, GREY_LIGHT, GREY_MID, radius=4)
+        text("No damage detected in submitted image", W/2, y-20, "Helvetica", 10, GREY_DARK, "center")
+        y -= 52
+
+    y -= 16
+
+    # ── FRAUD ANALYSIS SECTION ────────────────────────────
+    fraud     = data.get("fraud_analysis", {})
+    risk      = fraud.get("fraud_risk", "Low")
+    risk_color= RED if risk=="High" else AMBER if risk=="Medium" else GREEN
+    risk_bg   = RED_LIGHT if risk=="High" else AMBER_LIGHT if risk=="Medium" else GREEN_LIGHT
+
+    draw_rect(32, y-28, W-64, 28, risk_color, radius=6)
+    text("FRAUD ANALYSIS", 44, y-18, "Helvetica-Bold", 11, white)
+    risk_label = f"{risk.upper()} RISK"
+    rw = c.stringWidth(f"  {risk_label}  ", "Helvetica-Bold", 9) + 8
+    draw_rect(W-32-rw, y-24, rw, 20, risk_bg, risk_color, radius=4)
+    text(risk_label, W-32-rw/2, y-16, "Helvetica-Bold", 9, risk_color, "center")
+
+    y -= 40
+
+    flags = fraud.get("flags", [])
+    if flags:
+        for flag in flags:
+            draw_rect(32, y-28, W-64, 28, RED_LIGHT, RED, radius=4)
+            text("⚠", 44, y-16, "Helvetica", 10, RED)
+            flag_text = flag if isinstance(flag, str) else flag.get("message", str(flag))
+            if len(flag_text) > 85:
+                flag_text = flag_text[:82] + "..."
+            text(flag_text, 60, y-16, "Helvetica", 8, RED)
+            y -= 34
+    else:
+        draw_rect(32, y-28, W-64, 28, GREEN_LIGHT, GREEN, radius=4)
+        text("✓  No fraud indicators detected on this submission", 44, y-16, "Helvetica", 9, GREEN)
+        y -= 34
+
+    y -= 16
+
+    # ── RECOMMENDATION ────────────────────────────────────
+    rec       = data.get("recommendation", "")
+    is_approve= rec.startswith("APPROVE")
+    rec_color = GREEN if is_approve else RED
+    rec_bg    = GREEN_LIGHT if is_approve else RED_LIGHT
+    rec_icon  = "✓" if is_approve else "!"
+    rec_title = "APPROVED FOR PROCESSING" if is_approve else "FLAGGED FOR MANUAL REVIEW"
+
+    draw_rect(32, y-52, W-64, 52, rec_bg, rec_color, radius=6)
+    c.setFillColor(rec_color)
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(44, y-26, rec_icon)
+    text(rec_title, 68, y-22, "Helvetica-Bold", 12, rec_color)
+    text(rec, 68, y-38, "Helvetica", 8, rec_color)
+
+    y -= 68
+
+    # ── FOOTER ────────────────────────────────────────────
+    draw_rect(0, 0, W, 40, GREEN)
+    text("Generated by Hobbiton Investments AI Inspection System · YOLOv8m · v1.0",
+         W/2, 24, "Helvetica", 8, HexColor("#C3DEC9"), "center")
+    text("This report is AI-generated and advisory only. Final decisions rest with licensed claim handlers.",
+         W/2, 12, "Helvetica", 7, HexColor("#6BAF80"), "center")
+
+    c.save()
+    buf.seek(0)
+    return buf.read()
+
+
+@app.post("/inspect/report")
+async def inspect_and_report(file: UploadFile = File(...), skip_fraud: bool = False):
+    """Runs damage inspection and returns a downloadable PDF report."""
+
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    image_bytes = await file.read()
+    try:
+        image = Image.open(_io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read image")
+
+    max_size = 1280
+    if max(image.width, image.height) > max_size:
+        ratio = max_size / max(image.width, image.height)
+        image = image.resize(
+            (int(image.width*ratio), int(image.height*ratio)), Image.LANCZOS
+        )
+
+    start_time   = time.time()
+    results      = model.predict(image, conf=0.25, verbose=False)
+    inference_ms = round((time.time()-start_time)*1000, 1)
+    detections   = parse_detections(results, image)
+
+    fraud_flags  = [] if skip_fraud else run_fraud_checks(image, image_bytes, detections)
+    fraud_risk   = get_fraud_risk(fraud_flags)
+    ann_b64      = draw_damage_boxes(image, detections)
+
+    report_data = {
+        "claim_id":  f"CLM-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        "timestamp": datetime.now().isoformat(),
+        "image_info": {
+            "filename":   file.filename,
+            "dimensions": f"{image.width}x{image.height}",
+            "size_kb":    round(len(image_bytes)/1024, 1)
+        },
+        "damage_assessment": {
+            "damage_detected":   len(detections) > 0,
+            "total_detections":  len(detections),
+            "overall_severity":  get_overall_severity(detections),
+            "detections":        detections,
+            "inference_time_ms": inference_ms
+        },
+        "fraud_analysis": {
+            "fraud_risk": fraud_risk,
+            "flags":      fraud_flags,
+            "flagged":    len(fraud_flags) > 0
+        },
+        "recommendation": (
+            "APPROVE — No fraud flags, damage assessed"
+            if fraud_risk == "Low" and len(detections) > 0
+            else "REVIEW — Fraud flags raised, manual check required"
+            if fraud_risk in ["Medium", "High"]
+            else "REVIEW — No damage detected, request clearer photo"
+        ),
+        "annotated_image": {"data": ann_b64}
+    }
+
+    pdf_bytes = generate_pdf_report(report_data)
+
+    claim_id = report_data["claim_id"]
+    return StreamingResponse(
+        _io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={claim_id}_report.pdf"}
+    )
