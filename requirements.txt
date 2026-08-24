@@ -5,3 +5,5 @@ python-multipart
 gdown
 ultralytics
 opencv-python-headless
+reportlab
+numpy
