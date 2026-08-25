@@ -507,7 +507,7 @@ def generate_pdf_report(data: dict) -> bytes:
             c.rect(32, y-22, W-64, 22, fill=0, stroke=1)
 
             det_sev   = det.get("severity","")
-            det_color = RED if det_sev=="Severe" else AMBER if det_sev=="Moderate" else GREEN
+            det_color = TEXT_DARK
 
             text(str(idx+1),            cols[0]+4, y-14, "Helvetica", 8, GREY_DARK)
             text(det.get("class",""),   cols[1]+4, y-14, "Helvetica-Bold", 8, TEXT_DARK)
@@ -561,8 +561,8 @@ def generate_pdf_report(data: dict) -> bytes:
     # ── RECOMMENDATION ────────────────────────────────────
     rec       = data.get("recommendation", "")
     is_approve= rec.startswith("APPROVE")
-    rec_color = GREEN if is_approve else RED
-    rec_bg    = GREEN_LIGHT if is_approve else RED_LIGHT
+    rec_color = HexColor("#1A1A1A")
+    rec_bg    = HexColor("#F5F5F5")
     rec_icon  = "✓" if is_approve else "!"
     rec_title = "APPROVED FOR PROCESSING" if is_approve else "FLAGGED FOR MANUAL REVIEW"
 
