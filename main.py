@@ -22,6 +22,9 @@ from reportlab.lib.utils import ImageReader
 from fastapi.responses import StreamingResponse
 import io as _io
 
+from PIL import Image, ImageDraw, ImageChops, ImageEnhance
+import numpy as np
+
 # ── Download model from Google Drive if not present ───────────────
 MODEL_PATH     = "best.pt"
 GDRIVE_FILE_ID = "10K8spP0obRmGOCGudCWYnu4soe1ni6e9"
