@@ -147,24 +147,115 @@ def get_fraud_risk(flags):
     if len(flags) >= 1: return "Medium"
     return "Low"
 
+# ── EXIF extraction ───────────────────────────────────────
+def extract_exif(image: Image.Image) -> dict:
+    exif_data = {}
+    try:
+        raw = image._getexif()
+        if raw:
+            from PIL.ExifTags import TAGS, GPSTAGS
+            for tag_id, value in raw.items():
+                tag = TAGS.get(tag_id, tag_id)
+                if tag == "GPSInfo":
+                    gps = {}
+                    for gps_id, gps_val in value.items():
+                        gps[GPSTAGS.get(gps_id, gps_id)] = gps_val
+                    exif_data["GPS"] = gps
+                else:
+                    exif_data[tag] = value
+    except Exception:
+        pass
+    return exif_data
+
+# ── Error Level Analysis ──────────────────────────────────
+def check_ela(image: Image.Image, quality: int = 90) -> float:
+    try:
+        import io as _io
+        buf = _io.BytesIO()
+        image.convert("RGB").save(buf, format="JPEG", quality=quality)
+        buf.seek(0)
+        compressed = Image.open(buf).convert("RGB")
+        diff       = ImageChops.difference(image.convert("RGB"), compressed)
+        enhanced   = ImageEnhance.Brightness(diff).enhance(10)
+        import numpy as np
+        return float(np.array(enhanced).mean())
+    except Exception:
+        return 0.0
+
+# ── Fraud checks ──────────────────────────────────────────
 def run_fraud_checks(image: Image.Image, image_bytes: bytes, detections: list):
     flags = []
+
+    # Check 1 — Duplicate image
     img_hash = hashlib.md5(image_bytes).hexdigest()
     if img_hash in seen_hashes:
         flags.append("Duplicate image — this photo was submitted before")
     else:
         seen_hashes.add(img_hash)
+
+    # Check 2 — Resolution
     w, h = image.size
     if w < 300 or h < 300:
-        flags.append("Image resolution too low — may be a screenshot or thumbnail")
+        flags.append(f"Image resolution too low ({w}×{h}px) — may be a screenshot or thumbnail")
+
+    # Check 3 — EXIF metadata
+    exif = extract_exif(image)
+    if not exif:
+        flags.append("No EXIF metadata found — image may have been edited, screenshotted or downloaded")
+    else:
+        # Timestamp check
+        timestamp = exif.get("DateTime") or exif.get("DateTimeOriginal")
+        if timestamp:
+            try:
+                from datetime import datetime as dt
+                photo_time = dt.strptime(str(timestamp), "%Y:%m:%d %H:%M:%S")
+                age_days   = (dt.now() - photo_time).days
+                if age_days > 30:
+                    flags.append(f"Photo timestamp is {age_days} days old ({timestamp}) — inconsistent with a recent accident")
+                elif age_days < 0:
+                    flags.append(f"Photo timestamp is in the future ({timestamp}) — metadata may be manipulated")
+            except Exception:
+                pass
+
+        # GPS check
+        gps = exif.get("GPS", {})
+        if gps:
+            lat = gps.get("GPSLatitude")
+            lon = gps.get("GPSLongitude")
+            lat_ref = gps.get("GPSLatitudeRef", "")
+            lon_ref = gps.get("GPSLongitudeRef", "")
+            if lat and lon:
+                def dms_to_dd(dms, ref):
+                    try:
+                        d = float(dms[0]); m = float(dms[1]); s = float(dms[2])
+                        dd = d + m/60 + s/3600
+                        return -dd if ref in ["S","W"] else dd
+                    except Exception:
+                        return None
+                lat_dd = dms_to_dd(lat, lat_ref)
+                lon_dd = dms_to_dd(lon, lon_ref)
+                if lat_dd == 0.0 and lon_dd == 0.0:
+                    flags.append("GPS coordinates are (0,0) — location data appears invalid or spoofed")
+
+    # Check 4 — ELA manipulation detection
+    ela_score = check_ela(image)
+    if ela_score > 20:
+        flags.append(f"Image manipulation detected via Error Level Analysis (score: {ela_score:.1f}) — image may have been edited")
+
+    # Check 5 — Excessive detections
     if len(detections) > 12:
         flags.append(f"Unusually high damage count ({len(detections)} detections) — possible exaggeration")
-    preexisting = {"Corrosion", "Flaking", "Paint chip"}
+
+    # Check 6 — Pre-existing damage only
+    preexisting      = {"Corrosion", "Flaking", "Paint chip"}
     detected_classes = set(d["class"] for d in detections)
     if detections and detected_classes.issubset(preexisting):
-        flags.append("Only pre-existing damage types detected — possible prior damage claim")
+        flags.append("Only pre-existing damage types detected — damage may predate the reported accident")
+
+    # Check 7 — No damage
     if len(detections) == 0:
-        flags.append("No damage detected in submitted image")
+        flags.append("No damage detected in submitted image — photo may not show the damaged area")
+
     return flags
 
 def parse_detections(results, image):
@@ -364,6 +455,263 @@ async def inspect_video(file: UploadFile = File(...)):
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+# ── In-memory claims database ─────────────────────────────
+import uuid
+
+claims_db = {}  # stores all claims
+
+CLAIM_STATUSES = [
+    "SUBMITTED",
+    "PENDING_REVIEW",
+    "APPROVED",
+    "REJECTED",
+    "REPAIR_ASSIGNED",
+    "REPAIR_QUOTED",
+    "SETTLED"
+]
+
+# ── Submit claim endpoint ──────────────────────────────────
+@app.post("/claims/submit")
+async def submit_claim(
+    file: UploadFile = File(...),
+    policyholder_name: str = "Anonymous",
+    vehicle_reg: str = "Unknown",
+    accident_description: str = "No description provided"
+):
+    """Policyholder submits a claim with photo."""
+
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    image_bytes = await file.read()
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read image")
+
+    max_size = 1280
+    if max(image.width, image.height) > max_size:
+        ratio = max_size / max(image.width, image.height)
+        image = image.resize(
+            (int(image.width*ratio), int(image.height*ratio)), Image.LANCZOS
+        )
+
+    # Run AI inspection
+    start_time    = time.time()
+    results       = model.predict(image, conf=0.25, verbose=False)
+    inference_ms  = round((time.time()-start_time)*1000, 1)
+    detections    = parse_detections(results, image)
+    fraud_flags   = run_fraud_checks(image, image_bytes, detections)
+    fraud_risk    = get_fraud_risk(fraud_flags)
+    annotated_b64 = draw_damage_boxes(image, detections)
+
+    # Generate claim
+    claim_id  = f"CLM-{datetime.now().strftime('%Y%m%d%H%M%S')}-{str(uuid.uuid4())[:4].upper()}"
+    timestamp = datetime.now().isoformat()
+
+    recommendation = (
+        "APPROVE — No fraud flags, damage assessed"
+        if fraud_risk == "Low" and len(detections) > 0
+        else "REVIEW — Fraud flags raised, manual check required"
+        if fraud_risk in ["Medium", "High"]
+        else "REVIEW — No damage detected, request clearer photo"
+    )
+
+    claim = {
+        "claim_id":            claim_id,
+        "timestamp":           timestamp,
+        "status":              "PENDING_REVIEW",
+        "policyholder_name":   policyholder_name,
+        "vehicle_reg":         vehicle_reg,
+        "accident_description":accident_description,
+        "image_info": {
+            "filename":   file.filename,
+            "dimensions": f"{image.width}x{image.height}",
+            "size_kb":    round(len(image_bytes)/1024, 1)
+        },
+        "damage_assessment": {
+            "damage_detected":   len(detections) > 0,
+            "total_detections":  len(detections),
+            "overall_severity":  get_overall_severity(detections),
+            "detections":        detections,
+            "inference_time_ms": inference_ms
+        },
+        "fraud_analysis": {
+            "fraud_risk": fraud_risk,
+            "flags":      fraud_flags,
+            "flagged":    len(fraud_flags) > 0
+        },
+        "recommendation":  recommendation,
+        "annotated_image": {"data": annotated_b64},
+        "insurer_notes":   None,
+        "repair_shop":     None,
+        "repair_estimate": None,
+        "history": [
+            {"status": "SUBMITTED",      "timestamp": timestamp, "note": "Claim submitted by policyholder"},
+            {"status": "PENDING_REVIEW", "timestamp": timestamp, "note": "Automatically routed to insurer for review"}
+        ]
+    }
+
+    claims_db[claim_id] = claim
+    print(f"New claim saved: {claim_id} — Status: PENDING_REVIEW")
+
+    return JSONResponse(content={
+        "claim_id":        claim_id,
+        "status":          "PENDING_REVIEW",
+        "timestamp":       timestamp,
+        "message":         "Claim submitted successfully and routed to insurer",
+        "damage_assessment": claim["damage_assessment"],
+        "fraud_analysis":    claim["fraud_analysis"],
+        "recommendation":    recommendation,
+        "annotated_image":   claim["annotated_image"]
+    })
+
+
+# ── Get all claims (insurer view) ─────────────────────────
+@app.get("/claims")
+def get_all_claims(status: str = None):
+    """Returns all claims — optionally filtered by status."""
+    all_claims = list(claims_db.values())
+    if status:
+        all_claims = [c for c in all_claims if c["status"] == status.upper()]
+
+    # Return summary without annotated image for performance
+    summary = []
+    for c in sorted(all_claims, key=lambda x: x["timestamp"], reverse=True):
+        summary.append({
+            "claim_id":          c["claim_id"],
+            "status":            c["status"],
+            "timestamp":         c["timestamp"],
+            "policyholder_name": c["policyholder_name"],
+            "vehicle_reg":       c["vehicle_reg"],
+            "overall_severity":  c["damage_assessment"]["overall_severity"],
+            "fraud_risk":        c["fraud_analysis"]["fraud_risk"],
+            "recommendation":    c["recommendation"],
+            "total_detections":  c["damage_assessment"]["total_detections"]
+        })
+
+    return JSONResponse(content={
+        "total":  len(summary),
+        "claims": summary
+    })
+
+
+# ── Get single claim ──────────────────────────────────────
+@app.get("/claims/{claim_id}")
+def get_claim(claim_id: str):
+    """Returns full details of a single claim."""
+    if claim_id not in claims_db:
+        raise HTTPException(status_code=404, detail="Claim not found")
+    return JSONResponse(content=claims_db[claim_id])
+
+
+# ── Approve claim ─────────────────────────────────────────
+@app.post("/claims/{claim_id}/approve")
+def approve_claim(claim_id: str, notes: str = "Approved by insurer"):
+    """Insurer approves a claim and assigns to repair shop."""
+    if claim_id not in claims_db:
+        raise HTTPException(status_code=404, detail="Claim not found")
+
+    claim = claims_db[claim_id]
+    if claim["status"] not in ["PENDING_REVIEW"]:
+        raise HTTPException(status_code=400, detail=f"Cannot approve claim in status: {claim['status']}")
+
+    ts = datetime.now().isoformat()
+    claim["status"]        = "REPAIR_ASSIGNED"
+    claim["insurer_notes"] = notes
+    claim["repair_shop"]   = "Hobbiton Approved Repairs — Lusaka Central"
+    claim["history"].append({"status": "APPROVED",        "timestamp": ts, "note": notes})
+    claim["history"].append({"status": "REPAIR_ASSIGNED", "timestamp": ts, "note": f"Assigned to {claim['repair_shop']}"})
+
+    print(f"Claim {claim_id} APPROVED — assigned to repair shop")
+
+    return JSONResponse(content={
+        "claim_id":   claim_id,
+        "status":     "REPAIR_ASSIGNED",
+        "repair_shop": claim["repair_shop"],
+        "message":    "Claim approved and repair shop notified automatically"
+    })
+
+
+# ── Reject claim ──────────────────────────────────────────
+@app.post("/claims/{claim_id}/reject")
+def reject_claim(claim_id: str, reason: str = "Rejected by insurer"):
+    """Insurer rejects a claim."""
+    if claim_id not in claims_db:
+        raise HTTPException(status_code=404, detail="Claim not found")
+
+    claim = claims_db[claim_id]
+    ts = datetime.now().isoformat()
+    claim["status"]        = "REJECTED"
+    claim["insurer_notes"] = reason
+    claim["history"].append({"status": "REJECTED", "timestamp": ts, "note": reason})
+
+    return JSONResponse(content={
+        "claim_id": claim_id,
+        "status":   "REJECTED",
+        "reason":   reason,
+        "message":  "Claim rejected and policyholder notified"
+    })
+
+
+# ── Repair shop — get assigned jobs ───────────────────────
+@app.get("/claims/repair-shop/jobs")
+def get_repair_jobs():
+    """Returns all claims assigned to repair shop."""
+    jobs = [
+        {
+            "claim_id":          c["claim_id"],
+            "status":            c["status"],
+            "timestamp":         c["timestamp"],
+            "policyholder_name": c["policyholder_name"],
+            "vehicle_reg":       c["vehicle_reg"],
+            "overall_severity":  c["damage_assessment"]["overall_severity"],
+            "detections":        c["damage_assessment"]["detections"],
+            "repair_estimate":   c["repair_estimate"]
+        }
+        for c in claims_db.values()
+        if c["status"] in ["REPAIR_ASSIGNED", "REPAIR_QUOTED"]
+    ]
+    return JSONResponse(content={"total": len(jobs), "jobs": jobs})
+
+
+# ── Repair shop — submit estimate ─────────────────────────
+@app.post("/claims/{claim_id}/estimate")
+def submit_estimate(claim_id: str, amount_zmw: float = 0.0, notes: str = ""):
+    """Repair shop submits cost estimate."""
+    if claim_id not in claims_db:
+        raise HTTPException(status_code=404, detail="Claim not found")
+
+    claim = claims_db[claim_id]
+    ts    = datetime.now().isoformat()
+    claim["repair_estimate"] = {"amount_zmw": amount_zmw, "notes": notes, "submitted_at": ts}
+    claim["status"]          = "REPAIR_QUOTED"
+    claim["history"].append({"status": "REPAIR_QUOTED", "timestamp": ts, "note": f"Estimate: ZMW {amount_zmw:,.2f}"})
+
+    return JSONResponse(content={
+        "claim_id":       claim_id,
+        "status":         "REPAIR_QUOTED",
+        "amount_zmw":     amount_zmw,
+        "message":        "Estimate submitted — insurer notified for final approval"
+    })
+
+
+# ── Get claim status (policyholder tracking) ──────────────
+@app.get("/claims/{claim_id}/status")
+def get_claim_status(claim_id: str):
+    """Returns current status and history of a claim."""
+    if claim_id not in claims_db:
+        raise HTTPException(status_code=404, detail="Claim not found")
+
+    claim = claims_db[claim_id]
+    return JSONResponse(content={
+        "claim_id":   claim_id,
+        "status":     claim["status"],
+        "history":    claim["history"],
+        "repair_shop":     claim.get("repair_shop"),
+        "repair_estimate": claim.get("repair_estimate"),
+        "insurer_notes":   claim.get("insurer_notes")
+    })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
